@@ -21,38 +21,46 @@
 #include "storage/proc.h"
 
 #define INT_ACCESS_ONCE(var)	((int)(*((volatile int *)&(var))))
+#define FREELIST_LRU_SIZE NBuffers
 
 /* ----------------------------------------------------------------
  *				LRU Cache data structure and functions.
  * ----------------------------------------------------------------
  */
-typedef struct {
+typedef struct LruNode {
 	/* Id of the buffer.*/
 	Buffer buf_id;
 
-	Node* next;
-	Node* prev;
-} Node;
+	struct LruNode* next;
+	struct LruNode* prev;
+} LruNode;
 
 typedef struct {
 	slock_t lru_stack_lock;
 
-	Node* head;
-	Node* tail;
+	LruNode* head;
+	LruNode* tail;
 
 	// Node Hashmap
-	Node* node_table[NBuffers]; 
+	LruNode** node_table; 
 } LRUStack;
 
 /* Global lru stack. */
 static LRUStack* LruStack;
+
+void Push(Buffer buf_id);
+void Pop();
+void MoveVictimToTop(Buffer buf_id);
+void AddFirst(LruNode* x);
+void Remove(LruNode* x);
+LruNode* RemoveFirst();
 
 /*
 *  Push a new node to LRU head.
 */
 void
 Push(Buffer buf_id) {
-	Node* node = node_table[buf_id];
+	LruNode* node = LruStack->node_table[buf_id];
 	AddFirst(node);
 }
 
@@ -67,19 +75,19 @@ Pop() {
 /*
 *  Move victim node to LRU head. By default we assume buf_id is valid.
 */
-bool
+void
 MoveVictimToTop(Buffer buf_id) {
-	Node* bufNode = LruStack->node_table[buf_id];
+	LruNode* bufNode = LruStack->node_table[buf_id];
 	Remove(bufNode);
-	addFirst(bufNode);
+	AddFirst(bufNode);
 }
 
 /*
 *  Push helper function.
 */
 void
-AddFirst(Node* x) {
-	Node* head = LruStack->head;
+AddFirst(LruNode* x) {
+	LruNode* head = LruStack->head;
 
 	x->next = head->next;
 	head->next->prev = x;
@@ -91,18 +99,18 @@ AddFirst(Node* x) {
 }
 
 void
-Remove(Node* x) {
+Remove(LruNode* x) {
 	x->prev->next = x->next;
 	x->next->prev = x->prev;
 }
 
-Node*
+LruNode*
 RemoveFirst() {
 	if (LruStack->head->next == LruStack->tail)
 		// The stack is empty
         return NULL;
 	
-	Node* first = LruStack->head->next;
+	LruNode* first = LruStack->head->next;
     Remove(first);
     return first;
 }
@@ -281,7 +289,7 @@ have_free_buffer(void)
 void
 StrategyUpdateAccessedBuffer(int buf_id, bool delete)
 {
-	SpinLockAcquire(LruStack->lru_stack_lock);
+	SpinLockAcquire(&LruStack->lru_stack_lock);
 
 	MoveVictimToTop(buf_id);
 
@@ -289,7 +297,7 @@ StrategyUpdateAccessedBuffer(int buf_id, bool delete)
 		Pop();
 	}
 
-	SpinLockRelease(LruStack->lru_stack_lock); 
+	SpinLockRelease(&LruStack->lru_stack_lock); 
 }
 
 
@@ -311,7 +319,6 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state)
 {
 	BufferDesc *buf;
 	int			bgwprocno;
-	int			trycounter, selectedBuf;
 	uint32		local_buf_state;	/* to avoid repeated (de-)referencing */
 
 	/*
@@ -402,9 +409,9 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state)
 				// && BUF_STATE_GET_USAGECOUNT(local_buf_state) == 0)
 			{
 				if (strategy != NULL)
-					SpinLockAcquire(LruStack->lru_stack_lock);
+					SpinLockAcquire(&LruStack->lru_stack_lock);
 					Push(buf->buf_id);
-					SpinLockRelease(LruStack->lru_stack_lock);
+					SpinLockRelease(&LruStack->lru_stack_lock);
 				*buf_state = local_buf_state;
 				return buf;
 			}
@@ -413,9 +420,9 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state)
 	}
 
 	/* Nothing on the freelist, so run the LRU algorithm */
-	SpinLockAcquire(LruStack->lru_stack_lock);
-	Node* curr = LruStack->tail;
-	while (curr != head)
+	SpinLockAcquire(&LruStack->lru_stack_lock);
+	LruNode* curr = LruStack->tail;
+	while (curr != LruStack->head)
 	{
 		curr = curr->prev;
 		buf = GetBufferDescriptor(curr->buf_id);
@@ -426,6 +433,7 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state)
 			if (strategy != NULL)
 				MoveVictimToTop(curr->buf_id);
 			*buf_state = local_buf_state;
+			SpinLockRelease(&LruStack->lru_stack_lock);
 			return buf;
 		}
 		UnlockBufHdr(buf, local_buf_state);
@@ -439,10 +447,13 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state)
 		* infinite loop.
 		*/
 		UnlockBufHdr(buf, local_buf_state);
-		SpinLockRelease(LruStack->lru_stack_lock);
+		SpinLockRelease(&LruStack->lru_stack_lock);
 		elog(ERROR, "no unpinned buffers available");
 	}
-	SpinLockRelease(LruStack->lru_stack_lock);
+
+	// Should not reach here
+	SpinLockRelease(&LruStack->lru_stack_lock);
+	return NULL;
 }
 
 /*
@@ -553,7 +564,7 @@ StrategyShmemSize(void)
 	size = add_size(size, MAXALIGN(sizeof(BufferStrategyControl)));
 
 	/* size of maximum number of lru nodes */
-	size = add_size(size, mul_size(2 * NBuffers, sizeof(Node)));
+	size = add_size(size, mul_size(2 * NBuffers, sizeof(LruNode)));
 
 	/* size of lru stack */
 	size = add_size(size, sizeof(LruStack));
@@ -629,11 +640,11 @@ StrategyInitialize(bool init)
 
 	// Initialize head and tail in lru stack
 	bool is_head_found;
-	LruStack->head = (Node*) ShmemInitStruct("Buffer LRU Stack Head", sizeof(Node), &is_head_found);
+	LruStack->head = (LruNode*) ShmemInitStruct("Buffer LRU Stack Head", sizeof(LruNode), &is_head_found);
 	bool is_tail_found;
-	LruStack->tail = (Node*) ShmemInitStruct("Buffer LRU Stack Tail", sizeof(Node), &is_tail_found);
-	head->next = tail;
-	tail->prev = head;
+	LruStack->tail = (LruNode*) ShmemInitStruct("Buffer LRU Stack Tail", sizeof(LruNode), &is_tail_found);
+	LruStack->head->next = LruStack->tail;
+	LruStack->tail->prev = LruStack->head;
 
 	// Initialize node table in lru stack
 	int i = 0;
@@ -641,7 +652,7 @@ StrategyInitialize(bool init)
 		char* str;
 		bool is_node_found;
 		sprintf(str, "Buffer LRU Stack Node No.%d", i);
-		LruStack->node_table[i] = (Node*) ShmemInitStruct(str, sizeof(Node), &is_node_found);
+		LruStack->node_table[i] = (LruNode*) ShmemInitStruct(str, sizeof(LruNode), &is_node_found);
 	}
 }
 
