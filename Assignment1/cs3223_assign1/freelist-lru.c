@@ -310,7 +310,7 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state)
 {
 	BufferDesc *buf;
 	int			bgwprocno;
-	int			trycounter;
+	int			trycounter, selectedBuf;
 	uint32		local_buf_state;	/* to avoid repeated (de-)referencing */
 
 	/*
@@ -405,12 +405,14 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state)
 			 * put a valid buffer in the freelist and then someone else used
 			 * it before we got to it.  It's probably impossible altogether as
 			 * of 8.3, but we'd better check anyway.)
+			 * Here in LRU, we does not need buffer usage count.
 			 */
 			local_buf_state = LockBufHdr(buf);
-			if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0
-				&& BUF_STATE_GET_USAGECOUNT(local_buf_state) == 0)
+			if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0)
+				// && BUF_STATE_GET_USAGECOUNT(local_buf_state) == 0)
 			{
 				if (strategy != NULL)
+				//TODO: This part change to add buffer to LRU stack top.
 					AddBufferToRing(strategy, buf);
 				*buf_state = local_buf_state;
 				return buf;
@@ -419,37 +421,21 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state)
 		}
 	}
 
-	/* Nothing on the freelist, so run the "clock sweep" algorithm */
+	/* Nothing on the freelist, so run the LRU algorithm */
 	trycounter = NBuffers;
 	for (;;)
 	{
-		buf = GetBufferDescriptor(ClockSweepTick());
-
-		/*
-		 * If the buffer is pinned or has a nonzero usage_count, we cannot use
-		 * it; decrement the usage_count (unless pinned) and keep scanning.
-		 */
+		buf = GetBufferDescriptor(ClockSweepTick())
 		local_buf_state = LockBufHdr(buf);
-
 		if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0)
 		{
-			if (BUF_STATE_GET_USAGECOUNT(local_buf_state) != 0)
-			{
-				local_buf_state -= BUF_USAGECOUNT_ONE;
-
-				trycounter = NBuffers;
-			}
-			else
-			{
-				/* Found a usable buffer */
-				if (strategy != NULL)
-					AddBufferToRing(strategy, buf);
-				*buf_state = local_buf_state;
-				return buf;
-			}
-		}
-		else if (--trycounter == 0)
-		{
+			/* Found a usable buffer */
+			if (strategy != NULL)
+				//TODO: This part change to add buffer to LRU stack top.
+				AddBufferToRing(strategy, buf);
+			*buf_state = local_buf_state;
+			return buf;
+		} else if (--trycounter == 0) {
 			/*
 			 * We've scanned all the buffers without making any state changes,
 			 * so all the buffers are pinned (or were when we looked at them).
