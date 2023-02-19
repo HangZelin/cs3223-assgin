@@ -35,12 +35,17 @@ typedef struct {
 } Node;
 
 typedef struct {
+	slock_t lru_stack_lock;
+
 	Node* head;
 	Node* tail;
 
 	// Node Hashmap
 	Node*[] node_table; 
 } LRUStack;
+
+/* Global lru stack. */
+static LRUStack* LruStack;
 
 // /*
 // *  After Shared memory allocation, initialze data in LRUStack
@@ -288,7 +293,15 @@ have_free_buffer(void)
 void
 StrategyUpdateAccessedBuffer(int buf_id, bool delete)
 {
-	elog(ERROR, "StrategyUpdateAccessedBuffer: Not implemented!");
+	SpinLockAcquire(LruStack->lru_stack_lock);
+
+	MoveVictimToTop(buf_id);
+
+	if (delete) {
+		Pop();
+	}
+
+	SpinLockRelease(LruStack->lru_stack_lock); 
 }
 
 
@@ -468,6 +481,9 @@ StrategyFreeBuffer(BufferDesc *buf)
 		if (buf->freeNext < 0)
 			StrategyControl->lastFreeBuffer = buf->buf_id;
 		StrategyControl->firstFreeBuffer = buf->buf_id;
+
+		// Warn: POSSIBLE DEADLOCK!
+		StrategyUpdateAccessedBuffer(buf->buf_id, false);
 	}
 
 	SpinLockRelease(&StrategyControl->buffer_strategy_lock);
@@ -617,6 +633,11 @@ StrategyInitialize(bool init)
 	}
 	else
 		Assert(!init);
+
+	// Initialize lru stack
+	bool is_lru_stack_found;
+	LruStack = (LRUStack*) 
+		ShmemInitStruct("Buffer LRU Stack", sizeof(LRUStack), &is_lru_stack_found);
 }
 
 
