@@ -41,46 +41,27 @@ typedef struct {
 	Node* tail;
 
 	// Node Hashmap
-	Node*[] node_table; 
+	Node* node_table[NBuffers]; 
 } LRUStack;
 
 /* Global lru stack. */
 static LRUStack* LruStack;
-
-// /*
-// *  After Shared memory allocation, initialze data in LRUStack
-// */
-// void
-// Initialize() {
-// 	// TODO: initialize head and tail
-// 	Node* head;
-// 	Node* tail;
-// 	head->next = tail;
-// 	tail->prev = head;
-// 	// TODO: initialize Buffer HashMap.
-// }
 
 /*
 *  Push a new node to LRU head.
 */
 void
 Push(Buffer buf_id) {
-	// TODO: init Node
-	Node* newBuf = new Node(buf_id);
-	addFirst(newBuf)
-	// TODO: put in the map
-	lruStack->node_table[buf_id] = newBuf
+	Node* node = node_table[buf_id];
+	AddFirst(node);
 }
 
 /*
-*  Pop a a node from LRU tail.
+*  Pop a a node from LRU head.
 */
 void
 Pop() {
-	Node* first = RemoveFirst();
-	buf_id = first->buf_id
-	// remove the buffer from the hashTable.
-	lruStack->node_table[buf_id] = NULL
+	RemoveFirst();
 }
 
 /*
@@ -88,9 +69,9 @@ Pop() {
 */
 bool
 MoveVictimToTop(Buffer buf_id) {
-	Node* bufNode = lruStack->node_table[buf_id]
-	remove(bufNode)
-	addFirst(bufNode)
+	Node* bufNode = LruStack->node_table[buf_id];
+	Remove(bufNode);
+	addFirst(bufNode);
 }
 
 /*
@@ -98,10 +79,15 @@ MoveVictimToTop(Buffer buf_id) {
 */
 void
 AddFirst(Node* x) {
-	x->next = lruStack->head->prev
-	x->prev = lruStack->tail
-	lruStack->head->prev = x
-	lruStack->tail->next = x
+	Node* head = LruStack->head;
+
+	x->next = head->next;
+	head->next->prev = x;
+
+	head->next = x;
+	x->prev = head;
+
+	head = NULL;
 }
 
 void
@@ -112,10 +98,12 @@ Remove(Node* x) {
 
 Node*
 RemoveFirst() {
-	if (lruStack->head->next == lruStack->tail)
-        return null;
-	Node* first = lruStack->head->next;
-    remove(first);
+	if (LruStack->head->next == LruStack->tail)
+		// The stack is empty
+        return NULL;
+	
+	Node* first = LruStack->head->next;
+    Remove(first);
     return first;
 }
 
@@ -327,17 +315,6 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state)
 	uint32		local_buf_state;	/* to avoid repeated (de-)referencing */
 
 	/*
-	 * If given a strategy object, see whether it can select a buffer. We
-	 * assume strategy objects don't need buffer_strategy_lock.
-	 */
-	if (strategy != NULL)
-	{
-		buf = GetBufferFromRing(strategy, buf_state);
-		if (buf != NULL)
-			return buf;
-	}
-
-	/*
 	 * If asked, we need to waken the bgwriter. Since we don't want to rely on
 	 * a spinlock for this we force a read from shared memory once, and then
 	 * set the latch based on that value. We need to go through that length
@@ -425,8 +402,9 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state)
 				// && BUF_STATE_GET_USAGECOUNT(local_buf_state) == 0)
 			{
 				if (strategy != NULL)
-				//TODO: This part change to add buffer to LRU stack top.
-					AddBufferToRing(strategy, buf);
+					SpinLockAcquire(LruStack->lru_stack_lock);
+					Push(buf->buf_id);
+					SpinLockRelease(LruStack->lru_stack_lock);
 				*buf_state = local_buf_state;
 				return buf;
 			}
@@ -435,32 +413,36 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state)
 	}
 
 	/* Nothing on the freelist, so run the LRU algorithm */
-	trycounter = NBuffers;
-	for (;;)
+	SpinLockAcquire(LruStack->lru_stack_lock);
+	Node* curr = LruStack->tail;
+	while (curr != head)
 	{
-		buf = GetBufferDescriptor(ClockSweepTick())
+		curr = curr->prev;
+		buf = GetBufferDescriptor(curr->buf_id);
 		local_buf_state = LockBufHdr(buf);
 		if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0)
 		{
 			/* Found a usable buffer */
 			if (strategy != NULL)
-				//TODO: This part change to add buffer to LRU stack top.
-				AddBufferToRing(strategy, buf);
+				MoveVictimToTop(curr->buf_id);
 			*buf_state = local_buf_state;
 			return buf;
-		} else if (--trycounter == 0) {
-			/*
-			 * We've scanned all the buffers without making any state changes,
-			 * so all the buffers are pinned (or were when we looked at them).
-			 * We could hope that someone will free one eventually, but it's
-			 * probably better to fail than to risk getting stuck in an
-			 * infinite loop.
-			 */
-			UnlockBufHdr(buf, local_buf_state);
-			elog(ERROR, "no unpinned buffers available");
 		}
 		UnlockBufHdr(buf, local_buf_state);
 	}
+	if (curr == LruStack->head) {
+		/*
+		* We've scanned all the buffers without making any state changes,
+		* so all the buffers are pinned (or were when we looked at them).
+		* We could hope that someone will free one eventually, but it's
+		* probably better to fail than to risk getting stuck in an
+		* infinite loop.
+		*/
+		UnlockBufHdr(buf, local_buf_state);
+		SpinLockRelease(LruStack->lru_stack_lock);
+		elog(ERROR, "no unpinned buffers available");
+	}
+	SpinLockRelease(LruStack->lru_stack_lock);
 }
 
 /*
@@ -570,6 +552,12 @@ StrategyShmemSize(void)
 	/* size of the shared replacement strategy control block */
 	size = add_size(size, MAXALIGN(sizeof(BufferStrategyControl)));
 
+	/* size of maximum number of lru nodes */
+	size = add_size(size, mul_size(2 * NBuffers, sizeof(Node)));
+
+	/* size of lru stack */
+	size = add_size(size, sizeof(LruStack));
+
 	return size;
 }
 
@@ -638,6 +626,23 @@ StrategyInitialize(bool init)
 	bool is_lru_stack_found;
 	LruStack = (LRUStack*) 
 		ShmemInitStruct("Buffer LRU Stack", sizeof(LRUStack), &is_lru_stack_found);
+
+	// Initialize head and tail in lru stack
+	bool is_head_found;
+	LruStack->head = (Node*) ShmemInitStruct("Buffer LRU Stack Head", sizeof(Node), &is_head_found);
+	bool is_tail_found;
+	LruStack->tail = (Node*) ShmemInitStruct("Buffer LRU Stack Tail", sizeof(Node), &is_tail_found);
+	head->next = tail;
+	tail->prev = head;
+
+	// Initialize node table in lru stack
+	int i = 0;
+	for (i = 0; i < NBuffers; i++) {
+		char* str;
+		bool is_node_found;
+		sprintf(str, "Buffer LRU Stack Node No.%d", i);
+		LruStack->node_table[i] = (Node*) ShmemInitStruct(str, sizeof(Node), &is_node_found);
+	}
 }
 
 
